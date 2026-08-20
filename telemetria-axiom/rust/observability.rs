@@ -1,6 +1,9 @@
 //! Observabilidad: logs + traces a Axiom vía OpenTelemetry (OTLP). Rust.
 //! ===================================================================
-//! Estándar OTel→Axiom: dos datasets {proyecto}-logs / {proyecto}-traces, sin Collector.
+//! Estándar OTel→Axiom: dos datasets {proyecto}-logs / {proyecto}-traces, sin Collector. Agnóstico
+//! del tipo de proyecto: API HTTP, worker de colas, job programado, CLI o función serverless. Lo
+//! único que cambia es cuál es la UNIDAD DE TRABAJO (un request, un mensaje, una corrida, una
+//! invocación) y con qué frecuencia ocurre.
 //! Idiomático en Rust: se usa `tracing` para spans y eventos; capas de `tracing-opentelemetry` y
 //! `opentelemetry-appender-tracing` exportan a OTLP. Los eventos emitidos dentro de un span heredan
 //! el trace_id automáticamente (correlación).
@@ -31,10 +34,12 @@ use tracing_subscriber::prelude::*;
 
 // --- CONFIG DEL PROYECTO (ajustar) -------------------------------------------------------------
 const INSTRUMENTATION_SCOPE: &str = "observability";
-/// Spans de alta frecuencia a muestrear (consumidores por-mensaje). Vacío = exportar todos.
+/// Spans de alta frecuencia a muestrear: rutas HTTP con tráfico, consumidores por-mensaje, handlers
+/// serverless calientes. Vacío = exportar todos.
 const HIGH_FREQUENCY_SPANS: &[&str] = &[/* "process_queue_message" */];
-/// Target dedicado del run_summary (para filtrar volumen: solo esto + WARN/ERROR van a OTLP).
-pub const RUN_SUMMARY_TARGET: &str = "run_summary";
+/// Target dedicado del resumen de la unidad de trabajo (filtro de volumen: solo esto + WARN/ERROR
+/// van a OTLP).
+pub const SUMMARY_TARGET: &str = "operation_summary";
 
 fn opt(name: &str) -> Option<String> { env::var(name).ok() }
 
@@ -107,8 +112,8 @@ pub fn init_observability() -> Option<(sdktrace::TracerProvider, LoggerProvider)
     };
 
     // --- Subscriber de tracing: OTel traces + bridge de logs + filtro de volumen ---
-    // Volumen: a OTLP solo el target RUN_SUMMARY_TARGET (info) + WARN/ERROR del resto.
-    let filter = tracing_subscriber::EnvFilter::new(format!("warn,{RUN_SUMMARY_TARGET}=info"));
+    // Volumen: a OTLP solo el target SUMMARY_TARGET (info) + WARN/ERROR del resto.
+    let filter = tracing_subscriber::EnvFilter::new(format!("warn,{SUMMARY_TARGET}=info"));
     let registry = tracing_subscriber::registry().with(filter);
     // registry.with(tracer_provider.1 otel_layer).with(OpenTelemetryTracingBridge::new(&logger_provider)) ...
     // (armá el subscriber combinando las capas disponibles y hacé `.init()` una sola vez)
@@ -122,17 +127,23 @@ pub fn init_observability() -> Option<(sdktrace::TracerProvider, LoggerProvider)
 
 // --- Patrones de uso (con `tracing`) -----------------------------------------------------------
 
-/// UN evento por corrida de cada entry point. Emitilo DENTRO de un span para heredar el trace_id.
+/// UN evento por unidad de trabajo, SOLO para unidades de BAJA frecuencia (job, corrida de CLI,
+/// lote). Emitilo DENTRO de un span para heredar el trace_id. En unidades de ALTA frecuencia
+/// (por-request, por-mensaje) no lo emitas: alcanzan el span muestreado y los errores.
+///
+/// `otel.kind`: "server" (request HTTP entrante), "consumer" (mensaje de cola), "producer"
+/// (encolar), "client" (llamada saliente), "internal" (job, CLI, cómputo).
+///
 /// Ejemplo de uso (macro `tracing::info!` con el target dedicado y campos estructurados):
 ///
-///   let span = tracing::info_span!("MiJob", otel.kind = "internal");
+///   let span = tracing::info_span!("mi-operacion", otel.kind = "internal");
 ///   let _g = span.enter();
 ///   // ... trabajo ...
-///   tracing::info!(target: RUN_SUMMARY_TARGET,
-///       event.type = "run_summary", job.name = "MiJob", outcome = "success",
+///   tracing::info!(target: SUMMARY_TARGET,
+///       event.type = "operation_summary", operation.name = "mi-operacion", outcome = "success",
 ///       duration_ms = elapsed_ms, procesados = n);
 ///
-/// Errores (siempre se exportan): `tracing::error!(job.name = "MiJob", error = %e, "…");`
+/// Errores (siempre se exportan): `tracing::error!(operation.name = "mi-operacion", error = %e, "…");`
 ///
 /// Colas — propagación:
 ///   Productor: inyectar el contexto del span activo en el mensaje antes de encolar:

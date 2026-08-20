@@ -4,7 +4,7 @@ Dos formas de validar antes de desplegar. Ajustá el import `observability` a la
 
 ## 1. Correlación log↔trace (exportadores in-memory de OTel)
 
-Prueba que el `run_summary` emitido DENTRO de un `job_span` hereda el `trace_id` del span (y que
+Prueba que el `resumen` emitido DENTRO de un `work_span` hereda el `trace_id` del span (y que
 fuera del span daría 0). Es la prueba clave de que la correlación funciona.
 
 ```python
@@ -25,16 +25,16 @@ set_logger_provider(lp)
 h = LoggingHandler(level=logging.INFO, logger_provider=lp); h.addFilter(ob._FiltroVolumen())
 logging.getLogger().addHandler(h); logging.getLogger().setLevel(logging.INFO)
 
-with ob.job_span("MiJob"):
+with ob.work_span("mi-operacion"):
     tid = format(trace.get_current_span().get_span_context().trace_id, "032x")
-    ob.log_run_summary("MiJob", "cron", "success", 1.0, procesados=5)
+    ob.log_summary("mi-operacion", "core", "success", 1.0, procesados=5)
 lp.force_flush()
 
 rec = [l.log_record for l in le.get_finished_logs()
-       if (l.log_record.attributes or {}).get("event.type") == "run_summary"][0]
+       if (l.log_record.attributes or {}).get("event.type") == "operation_summary"][0]
 assert format(rec.trace_id, "032x") == tid   # LOG ATADO AL TRACE
-assert rec.attributes["job.name"] == "MiJob" and rec.attributes["procesados"] == 5
-print("OK: run_summary lleva el trace_id del span")
+assert rec.attributes["operation.name"] == "mi-operacion" and rec.attributes["procesados"] == 5
+print("OK: resumen lleva el trace_id del span")
 ```
 
 ## 2. Camino real de ingest (servidor HTTP local que captura el POST)
@@ -64,10 +64,10 @@ os.environ.update({
     "AXIOM_ENV": "dev", "OTEL_SERVICE_NAME": "mi-servicio",
     "AXIOM_LOGS_URL": f"{base}/v1/logs", "AXIOM_TRACES_URL": f"{base}/v1/traces",
 })
-from src.helpers.observability import setup_observability, job_span
+from src.helpers.observability import setup_observability, work_span
 setup_observability()
 logging.getLogger("app.x").warning("prueba")
-with job_span("MiJob"):
+with work_span("mi-operacion"):
     pass
 from opentelemetry._logs import get_logger_provider
 from opentelemetry import trace
@@ -87,9 +87,9 @@ print("OK: POST a /v1/logs y /v1/traces con headers correctos")
 import os
 for k in ("AXIOM_TOKEN", "AXIOM_DATASET", "AXIOM_TRACES_DATASET"):
     os.environ.pop(k, None)
-from src.helpers.observability import setup_observability, job_span, inject_trace_context
+from src.helpers.observability import setup_observability, work_span, inject_trace_context
 setup_observability()                 # no debe hacer nada ni fallar
-with job_span("X"):
+with work_span("X"):
     pass                              # no-op, ejecuta el cuerpo
 msg = {"id": 1}; inject_trace_context(msg)
 assert "traceparent" not in msg       # sin span activo, mensaje intacto

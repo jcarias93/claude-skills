@@ -3,9 +3,15 @@
  * =================================================================================
  * Estándar OTel→Axiom: dos datasets {proyecto}-logs / {proyecto}-traces, sin Collector.
  *
+ * Agnóstico del tipo de proyecto: API HTTP, worker de colas, job programado, CLI o función
+ * serverless. Lo único que cambia es cuál es la UNIDAD DE TRABAJO (un request, un mensaje, una
+ * corrida, una invocación) y con qué frecuencia ocurre.
+ *
  * Enfoque de VOLUMEN: NO se bridea todo el logger de la app a Axiom (eso satura y cuesta). Solo se
- * exportan, vía la Logs API de OTel, (a) un `logRunSummary` por corrida y (b) warnings/errores con
- * `logEvent`. El logging normal (pino/console) queda local.
+ * exportan, vía la Logs API de OTel, (a) un `logSummary` por unidad de trabajo de BAJA frecuencia y
+ * (b) warnings/errores con `logEvent`. El logging normal (pino/console) queda local. En unidades de
+ * ALTA frecuencia (por-request, por-mensaje) no se emite resumen: alcanzan el span muestreado y los
+ * errores.
  *
  * Paquetes:
  *   @opentelemetry/api @opentelemetry/api-logs @opentelemetry/resources
@@ -27,9 +33,10 @@ import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 
 // --- CONFIG DEL PROYECTO (ajustar) -------------------------------------------------------------
 const INSTRUMENTATION_SCOPE = 'observability';
-// Spans de alta frecuencia a muestrear (consumidores por-mensaje, etc.). Vacío = exportar todos.
+// Spans de alta frecuencia a muestrear: rutas HTTP con tráfico, consumidores por-mensaje, handlers
+// serverless calientes. Vacío = exportar todos.
 const HIGH_FREQUENCY_SPANS = new Set<string>([/* 'ProcessQueueMessage' */]);
-const RUN_SUMMARY_EVENT = 'run_summary';
+const SUMMARY_EVENT = 'operation_summary';
 
 function env(name: string): string | undefined { return process.env[name]; }
 function sampleRate(): number {
@@ -106,18 +113,20 @@ export function initObservability(): void {
 
 // --- Logs estructurados a Axiom (lo ÚNICO que se exporta a nivel info) ---------------------------
 
-/** UN log por corrida de cada entry point. Llamalo DENTRO de jobSpan() para que herede el trace_id. */
-export function logRunSummary(
-  jobName: string, component: string, outcome: string, durationMs: number,
+/** UN log por unidad de trabajo, solo para unidades de BAJA frecuencia (job, corrida de CLI, lote).
+ *  Llamalo DENTRO de workSpan() para que herede el trace_id. En unidades de alta frecuencia
+ *  (por-request, por-mensaje) NO lo llames: dispara el costo y el span ya mide. */
+export function logSummary(
+  operation: string, component: string, outcome: string, durationMs: number,
   extra: Record<string, string | number | boolean> = {},
 ): void {
   const attributes: Record<string, any> = {
-    'event.type': RUN_SUMMARY_EVENT, 'job.name': jobName, component, outcome,
+    'event.type': SUMMARY_EVENT, 'operation.name': operation, component, outcome,
     duration_ms: Math.round(durationMs * 100) / 100, ...extra,
   };
   logs.getLogger(INSTRUMENTATION_SCOPE).emit({
     severityNumber: SeverityNumber.INFO, severityText: 'INFO',
-    body: `[RUN] ${jobName} outcome=${outcome} duration_ms=${durationMs.toFixed(2)}`,
+    body: `[SUMMARY] ${operation} outcome=${outcome} duration_ms=${durationMs.toFixed(2)}`,
     attributes,
   });
 }
@@ -137,9 +146,11 @@ const KIND: Record<string, SpanKind> = {
   consumer: SpanKind.CONSUMER, producer: SpanKind.PRODUCER, client: SpanKind.CLIENT,
 };
 
-/** Ejecuta `fn` dentro de un span como current. Registra excepción + status ERROR y la RE-LANZA.
- *  Envolvé con esto el cuerpo del entry point (con logRunSummary/errores adentro). */
-export async function jobSpan<T>(name: string, kind: keyof typeof KIND, fn: (span: Span) => Promise<T> | T): Promise<T> {
+/** Ejecuta `fn` dentro del span de una unidad de trabajo. `kind`: 'server' (request HTTP entrante),
+ *  'consumer' (mensaje de cola), 'producer' (encolar), 'client' (llamada saliente), 'internal' (job,
+ *  CLI, cómputo). Registra excepción + status ERROR y la RE-LANZA. Envolvé con esto el cuerpo del
+ *  entry point (con logSummary/errores adentro). */
+export async function workSpan<T>(name: string, kind: keyof typeof KIND, fn: (span: Span) => Promise<T> | T): Promise<T> {
   if (!_tracesReady) return await fn(undefined as any);
   const tracer = trace.getTracer(INSTRUMENTATION_SCOPE);
   return await tracer.startActiveSpan(name, { kind: KIND[kind] ?? SpanKind.INTERNAL }, async (span) => {

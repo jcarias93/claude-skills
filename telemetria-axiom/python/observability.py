@@ -4,16 +4,24 @@ Observabilidad: logs + traces a Axiom vía OpenTelemetry (OTLP).
 
 Estándar: telemetría por OTLP directo a Axiom, sin Collector. Dos datasets por proyecto:
 `{proyecto}-logs` y `{proyecto}-traces`; el campo `service.name` identifica el repo dentro del dataset.
+Es agnóstico del tipo de proyecto: API HTTP, worker de colas, job programado, CLI o función
+serverless. Lo único que cambia es cuál es la UNIDAD DE TRABAJO (un request, un mensaje, una corrida,
+una invocación) y con qué frecuencia ocurre.
 
   - LOGS: se engancha el `LoggingHandler` de OTel al root logger; los `logging.*(...)` de la app se
-    exportan al dataset de logs. Filtro de volumen: a Axiom solo va el resumen estructurado por
-    corrida (event.type=run_summary) + todo WARNING/ERROR; el resto de INFO queda en consola.
-  - TRACES: `TracerProvider` + OTLPSpanExporter al dataset de traces. Se instrumentan los puntos de
-    entrada (timers/HTTP/colas) con spans (`job_span`/`consumer_span`). Propagación en colas:
-    `inject_trace_context` al encolar y `consumer_span(carrier=...)` al consumir (header W3C
-    `traceparent` dentro del mensaje).
+    exportan al dataset de logs. Filtro de volumen: a Axiom solo va el resumen estructurado
+    (event.type=operation_summary) + todo WARNING/ERROR; el resto de INFO queda en consola.
+  - TRACES: `TracerProvider` + OTLPSpanExporter al dataset de traces. Cada unidad de trabajo se
+    envuelve en un span con `work_span(name, kind=...)` — kind `server` para un request HTTP,
+    `consumer` para un mensaje de cola, `internal` para un job o una corrida de CLI. Propagación
+    entre procesos: `inject_trace_context` al encolar/llamar y `consumer_span(carrier=...)` al
+    consumir (header W3C `traceparent` dentro del mensaje).
   - Resource attrs: `service.name`, `deployment.environment`, `service.version`, `container.id`. El
     `trace_id` correlaciona ambos datasets: un log emitido DENTRO de un span lleva su trace_id.
+
+VOLUMEN (la regla que define el costo): `log_summary` es para unidades de BAJA frecuencia — un job,
+una corrida de CLI, un lote. En unidades de ALTA frecuencia (por-request, por-mensaje) no se emite
+resumen: alcanza con el span muestreado (`HIGH_FREQUENCY_SPANS`) y los WARNING/ERROR.
 
 Robustez: TODO gateado por env (sin `AXIOM_TOKEN` -> no-op) y envuelto en try/except — la
 observabilidad JAMÁS debe tumbar el arranque ni el procesamiento. Los helpers son no-op si OTel no
@@ -32,11 +40,12 @@ from contextlib import contextmanager
 # la ruta del módulo).
 _INSTRUMENTATION_SCOPE = "src.helpers.observability"
 # Spans de ALTA FRECUENCIA a muestrear (en vez de exportar el 100%). Poné acá los nombres de los spans
-# que se generan muchísimo (ej. consumidores de cola por mensaje). Vacío = exportar todos los spans.
+# que se generan muchísimo: rutas HTTP con tráfico, consumidores de cola por mensaje, handlers
+# serverless calientes. Vacío = exportar todos los spans.
 HIGH_FREQUENCY_SPANS: set = set()
 
 # --- Política de volumen de LOGS ---------------------------------------------------------------
-RUN_SUMMARY_EVENT = "run_summary"
+SUMMARY_EVENT = "operation_summary"
 # Output de estos loggers NO se exporta (evita loopear con el HTTP del exporter y ruido de SDKs).
 # Agregá acá cualquier logger de infraestructura ruidoso de tu proyecto.
 LOGGERS_EXCLUIDOS = ("urllib3", "requests", "opentelemetry", __name__)
@@ -76,7 +85,7 @@ class _FiltroVolumen(logging.Filter):
         if record.levelno >= logging.WARNING:
             return True
         if record.levelno >= logging.INFO:
-            return record.__dict__.get("event.type") == RUN_SUMMARY_EVENT
+            return record.__dict__.get("event.type") == SUMMARY_EVENT
         return False
 
 
@@ -199,31 +208,35 @@ def setup_observability():
             print(f"[obs] setup de traces falló: {e}", file=sys.stderr)
 
 
-def log_run_summary(job_name: str, component: str, outcome: str, duration_ms: float,
-                    queue_name: str = None, **metrics):
-    """Emite el ÚNICO INFO operativo que se exporta a Axiom por ejecución. Llamalo UNA vez por corrida
-    de cada entry point, DENTRO del `with job_span(...)` para que herede el trace_id (correlación).
+def log_summary(operation: str, component: str, outcome: str, duration_ms: float, **attributes):
+    """Emite el ÚNICO INFO operativo que se exporta a Axiom por unidad de trabajo. Llamalo UNA vez por
+    ejecución del entry point, DENTRO del `with work_span(...)` para que herede el trace_id.
 
-    outcome: 'success' | 'partial' | 'empty' | 'error' | 'timeout' | ...
-    metrics: pares clave=valor escalares; usá '__' en la clave para que en Axiom sea 'a.b' (dot).
+    SOLO para unidades de BAJA FRECUENCIA (job programado, corrida de CLI, lote completo). En una
+    unidad de alta frecuencia (por-request, por-mensaje) NO llames a esto: el span ya mide y este log
+    dispararía el costo; resumí a nivel del lote o dejá que hablen los spans + los errores.
+
+    operation: nombre estable de la unidad ('sync-inventario', 'GET /productos', 'procesar-lote').
+    component: subsistema al que pertenece ('inventario', 'api', 'etl').
+    outcome:   'success' | 'partial' | 'empty' | 'error' | 'timeout' | ...
+    attributes: pares clave=valor escalares (métricas y contexto: items=120, queue__name='skus').
+                Usá '__' en la clave para que en Axiom quede con punto: queue__name -> 'queue.name'.
     """
-    attributes = {
-        "event.type": RUN_SUMMARY_EVENT,
-        "job.name": job_name,
+    payload = {
+        "event.type": SUMMARY_EVENT,
+        "operation.name": operation,
         "component": component,
         "outcome": outcome,
         "duration_ms": round(float(duration_ms), 2),
     }
-    if queue_name:
-        attributes["queue.name"] = queue_name
-    for key, value in metrics.items():
+    for key, value in attributes.items():
         if value is None:
             continue
         name = key.replace("__", ".")
-        attributes[name] = value if isinstance(value, (str, bool, int, float)) else str(value)
+        payload[name] = value if isinstance(value, (str, bool, int, float)) else str(value)
 
-    logging.getLogger("app.run_summary").info(
-        "[RUN] %s outcome=%s duration_ms=%.2f", job_name, outcome, float(duration_ms), extra=attributes
+    logging.getLogger("app.summary").info(
+        "[SUMMARY] %s outcome=%s duration_ms=%.2f", operation, outcome, float(duration_ms), extra=payload
     )
 
 
@@ -234,10 +247,12 @@ def _tracer():
 
 
 @contextmanager
-def job_span(name: str, kind: str = "internal", attributes: dict = None):
-    """Abre un span como current. start_as_current_span registra la excepción, marca status ERROR y la
-    RE-LANZA (no la traga). ENVOLVÉ con esto el try/except del entry point (span afuera, try adentro)
-    para que log_run_summary y los logging.error hereden el trace_id."""
+def work_span(name: str, kind: str = "internal", attributes: dict = None):
+    """Abre el span de una unidad de trabajo como current. `kind`: 'server' (request HTTP entrante),
+    'consumer' (mensaje de cola), 'producer' (encolar), 'client' (llamada saliente), 'internal' (job,
+    CLI, cómputo). start_as_current_span registra la excepción, marca status ERROR y la RE-LANZA (no
+    la traga). ENVOLVÉ con esto el try/except del entry point (span afuera, try adentro) para que
+    log_summary y los logging.error hereden el trace_id."""
     tracer = _tracer()
     if tracer is None:
         yield None
@@ -279,20 +294,20 @@ def inject_trace_context(carrier: dict) -> dict:
 
 
 def traced(name: str, kind: str = "internal"):
-    """Decorador (sync o async) que envuelve una función en un `job_span`. OJO: en Azure Functions v2
+    """Decorador (sync o async) que envuelve una función en un `work_span`. OJO: en Azure Functions v2
     NO decores los handlers registrados (la introspección del SDK puede romperse); ahí preferí envolver
-    la llamada interna con `with job_span(...)`. Útil para funciones normales."""
+    la llamada interna con `with work_span(...)`. Útil para funciones normales."""
     def deco(fn):
         if inspect.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def awrap(*a, **k):
-                with job_span(name, kind):
+                with work_span(name, kind):
                     return await fn(*a, **k)
             return awrap
 
         @functools.wraps(fn)
         def wrap(*a, **k):
-            with job_span(name, kind):
+            with work_span(name, kind):
                 return fn(*a, **k)
         return wrap
     return deco

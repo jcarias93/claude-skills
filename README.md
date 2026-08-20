@@ -6,7 +6,7 @@ al proyecto en el que estés trabajando.
 
 | Skill | Qué hace | Lenguajes |
 |---|---|---|
-| [`telemetria-axiom/`](telemetria-axiom/) | Telemetría OpenTelemetry → Axiom: logs estructurados + traces correlacionados por `trace_id`, vía OTLP directo (sin Collector) | Python · Node.js/TS · C# · Rust |
+| [`telemetria-axiom/`](telemetria-axiom/) | Telemetría OpenTelemetry → Axiom: logs estructurados + traces correlacionados por `trace_id`, vía OTLP directo (sin Collector). Agnóstica del tipo de proyecto | Python · Node.js/TS · C# · Rust |
 
 ---
 
@@ -34,15 +34,33 @@ Verificá que Claude Code la vea con `/skills` — debería aparecer `telemetria
 
 ## Qué resuelve
 
-Un servicio o worker (timers, colas, HTTP) en el que no podés ver si sus operaciones corren, cuánto
-tardan y si fallan. La skill instrumenta el servicio para que exporte a Axiom:
+Cualquier servicio en el que no podés ver si sus operaciones corren, cuánto tardan y si fallan: API
+HTTP, worker de colas, job programado, CLI o función serverless. La skill lo instrumenta para que
+exporte a Axiom:
 
-- **Logs** — un resumen estructurado por corrida (`event.type=run_summary`) + todo WARNING/ERROR.
-- **Traces** — un span por punto de entrada, con propagación de contexto a través de las colas.
+- **Logs** — un resumen estructurado por unidad de trabajo (`event.type=operation_summary`) + todo
+  WARNING/ERROR.
+- **Traces** — un span por unidad de trabajo, con propagación de contexto entre procesos.
 - **Correlación** — el `trace_id` cruza ambos datasets: de un log de error saltás al trace completo.
 
 Todo por **OTLP directo a Axiom, sin Collector**, y **100% configurado por variables de entorno**:
 sin `AXIOM_TOKEN` la instrumentación es no-op y la app corre igual.
+
+### El concepto: la unidad de trabajo
+
+La skill no asume que estés instrumentando un job. Una **unidad de trabajo** es una ejecución de un
+punto de entrada, y todo el estándar se define sobre ella: un span por unidad, y como mucho un log de
+resumen por unidad. Lo que cambia entre proyectos es qué es la unidad y con qué frecuencia ocurre —
+de ahí sale la política de logs.
+
+| Tipo de entry point | Unidad de trabajo | `kind` | Frecuencia | ¿Log de resumen? |
+|---|---|---|---|---|
+| Job programado / timer | una corrida | `internal` | baja | ✅ uno por corrida |
+| CLI / script one-shot | una invocación | `internal` | baja | ✅ uno por invocación |
+| Batch / ETL | un lote | `internal` | baja | ✅ uno por lote |
+| Consumidor de cola | un mensaje | `consumer` | **alta** | ❌ resumí a nivel del lote |
+| Request HTTP entrante | un request | `server` | **alta** | ❌ solo span + errores |
+| Función serverless | una invocación | según trigger | variable | según su frecuencia real |
 
 ## Antes de empezar (los provee el dueño de la org de Axiom)
 
@@ -70,12 +88,13 @@ Claude entonces:
 
 1. Detecta el lenguaje y copia el template correspondiente al proyecto (ej. a
    `src/helpers/observability.py`), sin reescribir la lógica desde cero.
-2. Ajusta la config del template: el scope de instrumentación y qué spans son de alta frecuencia.
-3. Agrega las dependencias de OTel al manifiesto (`requirements.txt`, `package.json`, `.csproj`, `Cargo.toml`).
-4. Llama a `setup_observability()` una vez al arranque.
-5. Envuelve cada punto de entrada en un span, con el `run_summary` y los errores **adentro** del span.
-6. En las colas, inyecta el `traceparent` al encolar y lo extrae al consumir.
-7. Te deja las consultas APL listas para pegar en Axiom.
+2. Identifica cuáles son las unidades de trabajo del proyecto y con qué frecuencia corren.
+3. Ajusta la config del template: el scope de instrumentación y qué spans son de alta frecuencia.
+4. Agrega las dependencias de OTel al manifiesto (`requirements.txt`, `package.json`, `.csproj`, `Cargo.toml`).
+5. Llama a `setup_observability()` una vez al arranque.
+6. Envuelve cada unidad de trabajo en un span con su `kind`, con el resumen y los errores **adentro**.
+7. Propaga el `traceparent` entre procesos: al encolar o llamar, y lo extrae al consumir o recibir.
+8. Te deja las consultas APL listas para pegar en Axiom.
 
 ## Variables de entorno
 
@@ -103,15 +122,15 @@ from src.helpers.observability import setup_observability
 setup_observability()   # no-op si no hay AXIOM_TOKEN; nunca tumba el arranque
 ```
 
-**Un punto de entrada** — span afuera, try/except adentro, para que el resumen y los errores
-hereden el `trace_id`:
+**Una unidad de baja frecuencia** — span afuera, try/except adentro, para que el resumen y los
+errores hereden el `trace_id`:
 
 ```python
-from src.helpers.observability import job_span, log_run_summary
+from src.helpers.observability import work_span, log_summary
 
 def procesar_lote():
     t0 = time.perf_counter()
-    with job_span("procesar_lote", kind="internal"):
+    with work_span("procesar-lote", kind="internal"):
         procesados, outcome = 0, "success"
         try:
             procesados = hacer_trabajo()
@@ -120,14 +139,26 @@ def procesar_lote():
             logging.exception("falló el lote")   # va a Axiom con su trace_id
             raise
         finally:
-            log_run_summary(
-                "procesar_lote", component="worker", outcome=outcome,
+            log_summary(
+                "procesar-lote", component="etl", outcome=outcome,
                 duration_ms=(time.perf_counter() - t0) * 1000,
                 items=procesados,                # métricas libres
             )
 ```
 
-**Colas** — el trace continúa del productor al consumidor:
+**Una unidad de alta frecuencia** — span con su `kind`, sin log de resumen: el span ya mide, y un
+log por request o por mensaje es lo que dispara la factura.
+
+```python
+with work_span("GET /productos/:id", kind="server",
+               attributes={"http.method": "GET", "http.route": "/productos/:id"}):
+    ...
+```
+
+Ojo con el nombre del span: `GET /productos/:id`, nunca `GET /productos/123` — el id va como
+atributo. Un nombre de alta cardinalidad vuelve el trace inconsultable.
+
+**Propagación entre procesos** — el trace continúa del productor al consumidor:
 
 ```python
 from src.helpers.observability import consumer_span, inject_trace_context
@@ -144,15 +175,19 @@ with consumer_span("procesar_sku", carrier=mensaje, attributes={"sku": mensaje["
 
 ## La regla de costo (la lección más cara)
 
-**A nivel INFO se exporta SOLO el `run_summary`** — uno por corrida — más todo WARNING/ERROR.
-Nunca logs por-ítem (por SKU, por request, por mensaje): en un consumidor de cola son cientos o
-miles por corrida y disparan la factura. Esos quedan en consola, no en Axiom. Los spans de alta
-frecuencia se muestrean con `ParentBased(root=ratio)` (10% por defecto) para no saturar traces sin
-romper la jerarquía del trace.
+**La política sale de la frecuencia de la unidad, no del tipo de proyecto.** A nivel INFO se exporta
+solo el resumen de las unidades de **baja** frecuencia, más todo WARNING/ERROR. Nunca logs por-ítem
+de alta frecuencia (por SKU, por request, por mensaje): en un consumidor de cola o un API con tráfico
+son cientos o miles por minuto y disparan la factura. Esos quedan en consola, no en Axiom.
+
+Regla práctica: si la unidad corre **más de ~1 vez por segundo sostenido**, no emitas resumen por
+unidad — dejá que hablen el span y los errores, y si querés un INFO igual, ponelo un nivel más arriba
+(por lote o por ventana de tiempo). Los spans de alta frecuencia se muestrean con
+`ParentBased(root=ratio)` (10% por defecto) para no saturar traces sin romper la jerarquía del trace.
 
 ## Verificar (sin depender de Axiom)
 
-1. **Correlación** — con exportadores in-memory, emitir un `run_summary` dentro de un span y
+1. **Correlación** — con exportadores in-memory, emitir un `operation_summary` dentro de un span y
    confirmar que `log.trace_id == span.trace_id`.
 2. **Camino real** — apuntar `AXIOM_LOGS_URL`/`AXIOM_TRACES_URL` a un servidor HTTP local y validar
    el path (`/v1/logs`, `/v1/traces`) y los headers (`Authorization`, `X-Axiom-Dataset`).
@@ -166,10 +201,10 @@ Los atributos OTLP quedan anidados y **logs y traces mapean distinto** — el de
 mapeo está en el [`SKILL.md`](telemetria-axiom/SKILL.md).
 
 ```kusto
-// ¿corrieron los jobs?
+// ¿corrieron las operaciones, y cómo les fue?
 ['{proyecto}-logs']
-| where ['attributes.event.type'] == 'run_summary'
-| project _time, ['attributes.job.name'], ['attributes.outcome'], ['attributes.duration_ms'], trace_id
+| where ['attributes.event.type'] == 'operation_summary'
+| project _time, ['attributes.operation.name'], ['attributes.outcome'], ['attributes.duration_ms'], trace_id
 | sort by _time desc
 
 // del trace_id de un error, ver el trace completo

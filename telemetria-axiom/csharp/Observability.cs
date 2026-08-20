@@ -7,9 +7,15 @@
 //   OpenTelemetry.Exporter.OpenTelemetryProtocol
 //   Microsoft.Extensions.Logging
 //
+// Agnóstico del tipo de proyecto: API HTTP, worker de colas, job programado, CLI o función
+// serverless. Lo único que cambia es cuál es la UNIDAD DE TRABAJO (un request, un mensaje, una
+// corrida, una invocación) y con qué frecuencia ocurre.
+//
 // VOLUMEN: el exporter de logs se configura con nivel mínimo Warning + una categoría dedicada para
-// el run_summary (Information). Así a Axiom van solo los run_summary y los warnings/errores; el resto
-// del logging de la app queda local. Ajustá el filtro en Init según tu app.
+// el resumen (Information). Así a Axiom van solo los resúmenes y los warnings/errores; el resto del
+// logging de la app queda local. Ajustá el filtro en Init según tu app. El resumen es para unidades
+// de BAJA frecuencia; en las de ALTA frecuencia (por-request, por-mensaje) alcanzan el span
+// muestreado y los errores.
 //
 // ⚠️ Template a validar en un proyecto real (el de Python es el probado end-to-end).
 using System;
@@ -26,13 +32,14 @@ public static class Observability
 {
     // --- CONFIG DEL PROYECTO (ajustar) ---------------------------------------------------------
     private const string InstrumentationScope = "Observability";
-    // Spans de alta frecuencia a muestrear (consumidores por-mensaje, etc.). Vacío = exportar todos.
+    // Spans de alta frecuencia a muestrear: rutas HTTP con tráfico, consumidores por-mensaje,
+    // handlers serverless calientes. Vacío = exportar todos.
     private static readonly HashSet<string> HighFrequencySpans = new() { /* "ProcessQueueMessage" */ };
 
     public static readonly ActivitySource Source = new(InstrumentationScope);
     private static TracerProvider? _tracer;
     private static ILoggerFactory? _loggerFactory;
-    public static ILogger RunSummaryLogger { get; private set; } = new NullLogger();
+    public static ILogger SummaryLogger { get; private set; } = new NullLogger();
     private static readonly TextMapPropagator Propagator = Propagators.DefaultTextMapPropagator;
 
     private static string? Env(string n) => Environment.GetEnvironmentVariable(n);
@@ -90,10 +97,10 @@ public static class Observability
             {
                 _loggerFactory = LoggerFactory.Create(builder =>
                 {
-                    // Solo run_summary (categoría dedicada) + Warning/Error del resto llegan a Axiom.
-                    builder.AddFilter("Observability.RunSummary", LogLevel.Information);
+                    // Solo el resumen (categoría dedicada) + Warning/Error del resto llegan a Axiom.
+                    builder.AddFilter("Observability.Summary", LogLevel.Information);
                     builder.AddFilter((category, level) =>
-                        category == "Observability.RunSummary" ? level >= LogLevel.Information
+                        category == "Observability.Summary" ? level >= LogLevel.Information
                                                                : level >= LogLevel.Warning);
                     builder.AddOpenTelemetry(o =>
                     {
@@ -107,7 +114,7 @@ public static class Observability
                         });
                     });
                 });
-                RunSummaryLogger = _loggerFactory.CreateLogger("Observability.RunSummary");
+                SummaryLogger = _loggerFactory.CreateLogger("Observability.Summary");
             }
             catch (Exception e) { Console.Error.WriteLine($"[obs] setup de logs falló: {e}"); }
         }
@@ -115,21 +122,22 @@ public static class Observability
 
     public static void Shutdown() { _tracer?.Dispose(); _loggerFactory?.Dispose(); }
 
-    // --- Log estructurado a Axiom (uno por corrida). Emitilo DENTRO del span (hereda trace_id). ---
-    public static void LogRunSummary(string jobName, string component, string outcome, double durationMs,
+    // --- Log estructurado a Axiom: UNO por unidad de trabajo, solo para unidades de BAJA frecuencia
+    // (job, corrida de CLI, lote). Emitilo DENTRO del span para que herede el trace_id. ---
+    public static void LogSummary(string operation, string component, string outcome, double durationMs,
         IReadOnlyDictionary<string, object>? metrics = null)
     {
         // Los pares se emiten como structured state -> atributos consultables en Axiom.
-        using var scope = RunSummaryLogger.BeginScope(BuildState(jobName, component, outcome, durationMs, metrics));
-        RunSummaryLogger.LogInformation("[RUN] {job} outcome={outcome} duration_ms={ms}", jobName, outcome, durationMs);
+        using var scope = SummaryLogger.BeginScope(BuildState(operation, component, outcome, durationMs, metrics));
+        SummaryLogger.LogInformation("[SUMMARY] {operation} outcome={outcome} duration_ms={ms}", operation, outcome, durationMs);
     }
 
-    private static Dictionary<string, object> BuildState(string job, string comp, string outcome, double ms,
+    private static Dictionary<string, object> BuildState(string operation, string comp, string outcome, double ms,
         IReadOnlyDictionary<string, object>? metrics)
     {
         var s = new Dictionary<string, object>
         {
-            ["event.type"] = "run_summary", ["job.name"] = job, ["component"] = comp,
+            ["event.type"] = "operation_summary", ["operation.name"] = operation, ["component"] = comp,
             ["outcome"] = outcome, ["duration_ms"] = Math.Round(ms, 2),
         };
         if (metrics != null) foreach (var kv in metrics) s[kv.Key] = kv.Value;
@@ -143,8 +151,11 @@ public static class Observability
         "producer" => ActivityKind.Producer, "client" => ActivityKind.Client, _ => ActivityKind.Internal,
     };
 
-    /// <summary>Ejecuta la acción dentro de un span. Registra excepción + status ERROR y la RE-LANZA.</summary>
-    public static T JobSpan<T>(string name, string kind, Func<Activity?, T> fn)
+    /// <summary>Ejecuta la acción dentro del span de una unidad de trabajo. <paramref name="kind"/>:
+    /// "server" (request HTTP entrante), "consumer" (mensaje de cola), "producer" (encolar),
+    /// "client" (llamada saliente), "internal" (job, CLI, cómputo). Registra excepción + status
+    /// ERROR y la RE-LANZA.</summary>
+    public static T WorkSpan<T>(string name, string kind, Func<Activity?, T> fn)
     {
         using var activity = Source.StartActivity(name, Kind(kind));
         try { return fn(activity); }
